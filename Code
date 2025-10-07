@@ -1,1 +1,551 @@
+# Evaluate throughput performance 
 
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.integrate import odeint
+from scipy import signal
+import random
+import time
+from dataclasses import dataclass
+from typing import List, Dict, Tuple
+import pandas as pd
+
+@dataclass
+class SimulationParameters:
+    """Configuration parameters for Hydra-RAN simulation"""
+    # Velocity range (km/h)
+    velocities: np.ndarray = None
+    # FR1 parameters
+    fr1_frequency: float = 2.6e9  # 2.6 GHz
+    fr1_bandwidth: float = 20e6   # 20 MHz
+    fr1_power: float = 23         # 23 dBm
+    # FRn parameters (mmWave)
+    frn_frequency: float = 28e9   # 28 GHz
+    frn_bandwidth: float = 100e6  # 100 MHz
+    frn_power: float = 20         # 20 dBm
+    # Channel parameters
+    noise_spectral_density: float = -174  # dBm/Hz
+    # Threshold parameters
+    sinr_th_low: float = 5.0      # Γ_th_low
+    sinr_th_high: float = 10.0    # Γ_th_high  
+    sinr_th_react: float = 12.0   # Γ_th_react
+    # SMTL weights
+    omega1: float = 0.4    # ω₁ - spectral efficiency weight
+    omega2: float = 0.3    # ω₂ - reliability weight
+    omega3: float = 0.3    # ω₃ - switching cost weight
+    # Simulation
+    num_ues: int = 10
+    simulation_time: float = 100.0  # seconds
+
+class HydraRANChannel:
+    """Implements the channel model from Section 4.1 of the manuscript"""
+    
+    def __init__(self, params: SimulationParameters):
+        self.params = params
+        self.setup_channel_parameters()
+    
+    def setup_channel_parameters(self):
+        """Initialize channel parameters based on 3GPP models"""
+        # Path loss parameters (3GPP TR 38.901)
+        self.fr1_pl_alpha = 3.5    # Path loss exponent
+        self.fr1_pl_beta = 32.4    # Intercept (dB)
+        self.frn_pl_alpha = 4.5    # Higher exponent for mmWave
+        self.frn_pl_beta = 61.4    # Higher intercept for mmWave
+        
+        # Blockage parameters
+        self.blockage_probability = 0.2
+        self.blockage_duration = 2.0  # seconds
+        
+        # Mobility parameters
+        self.doppler_spectrum = []
+    
+    def path_loss(self, distance: float, frequency: float, is_frn: bool) -> float:
+        """Calculate path loss in dB using 3GPP model"""
+        if is_frn:
+            alpha = self.frn_pl_alpha
+            beta = self.frn_pl_beta
+        else:
+            alpha = self.fr1_pl_alpha  
+            beta = self.fr1_pl_beta
+            
+        # Basic path loss model: PL = β + 10α⋅log10(d)
+        pl_dB = beta + 10 * alpha * np.log10(max(distance, 1.0))
+        return pl_dB
+    
+    def calculate_sinr(self, distance: float, velocity: float, is_frn: bool, 
+                      time_index: int) -> float:
+        """Calculate SINR based on distance, velocity, and frequency band"""
+        # Calculate path loss
+        frequency = self.params.frn_frequency if is_frn else self.params.fr1_frequency
+        pl_dB = self.path_loss(distance, frequency, is_frn)
+        
+        # Calculate received power
+        tx_power = self.params.frn_power if is_frn else self.params.fr1_power
+        rx_power_dBm = tx_power - pl_dB
+        
+        # Calculate noise power
+        bandwidth = self.params.frn_bandwidth if is_frn else self.params.fr1_bandwidth
+        noise_power_dBm = self.params.noise_spectral_density + 10 * np.log10(bandwidth)
+        
+        # Simple interference model (could be enhanced)
+        interference_dBm = -90  # Fixed interference level
+        
+        # Calculate SINR
+        sinr_linear = 10**((rx_power_dBm - 10)/10) / (
+            10**((noise_power_dBm - 10)/10) + 10**((interference_dBm - 10)/10))
+        
+        # Velocity-dependent degradation (higher velocity = lower SINR)
+        velocity_penalty = 1.0 / (1.0 + 0.01 * velocity)
+        sinr_linear *= velocity_penalty
+        
+        # Time-varying fading (simple model)
+        fading = 1.0 + 0.1 * np.sin(2 * np.pi * time_index / 100)
+        sinr_linear *= fading
+        
+        return 10 * np.log10(max(sinr_linear, 1e-10))  # Return in dB
+
+class HydraRANSMTL:
+    """Implements the SMTL framework from Section 3 of the manuscript"""
+    
+    def __init__(self, params: SimulationParameters):
+        self.params = params
+        self.setup_smtl_parameters()
+    
+    def setup_smtl_parameters(self):
+        """Initialize SMTL model parameters"""
+        # Multi-task learning weights
+        self.task_weights = {
+            'beam_prediction': 0.25,
+            'blockage_prediction': 0.25, 
+            'mobility_prediction': 0.25,
+            'sinr_prediction': 0.25
+        }
+        
+        # Sensor data processing parameters
+        self.sensor_confidence_threshold = 0.7
+        
+    def utility_function(self, spectral_efficiency: float, reliability: float, 
+                        switching_cost: float) -> float:
+        """Equation 1: Context-aware utility function"""
+        return (self.params.omega1 * spectral_efficiency + 
+                self.params.omega2 * reliability - 
+                self.params.omega3 * switching_cost)
+    
+    def spectral_efficiency_component(self, sinr: float, is_frn: bool) -> float:
+        """Equation 2: Spectral efficiency component"""
+        bandwidth = self.params.frn_bandwidth if is_frn else self.params.fr1_bandwidth
+        max_bandwidth = max(self.params.fr1_bandwidth, self.params.frn_bandwidth)
+        
+        # Shannon capacity with practical implementation loss
+        spectral_efficiency = np.log2(1 + 10**(sinr/10))
+        normalized_efficiency = (bandwidth / max_bandwidth) * spectral_efficiency
+        
+        return normalized_efficiency
+    
+    def reliability_component(self, blockage_prob: float, handover_latency: float, 
+                             max_latency: float) -> float:
+        """Equation 3: Reliability metric"""
+        blockage_component = 1.0 - blockage_prob
+        latency_component = np.exp(-handover_latency / max_latency)
+        
+        return blockage_component * latency_component
+
+class HydraRANSimulator:
+    """Main simulator implementing the Hydra-RAN Task₄ framework"""
+    
+    def __init__(self, params: SimulationParameters):
+        self.params = params
+        self.channel = HydraRANChannel(params)
+        self.smtl = HydraRANSMTL(params)
+        self.results = {}
+        
+    def simulate_throughput_vs_velocity(self):
+        """Main simulation function for throughput vs velocity analysis"""
+        print("Starting Hydra-RAN Task₄ Throughput Simulation...")
+        
+        velocities = np.linspace(1, 60, 20)  # 1 to 60 km/h
+        throughput_results = {
+            'task4_policy1': [],
+            'task4_policy2': [], 
+            '5g_nr_standard': [],
+            'dual_connectivity': [],
+            'drl_driven': [],
+            'isac_baseline': []
+        }
+        
+        for velocity in velocities:
+            print(f"Simulating velocity: {velocity:.1f} km/h")
+            
+            # Simulate each scheme
+            tp_task4_p1 = self.simulate_task4_policy1(velocity)
+            tp_task4_p2 = self.simulate_task4_policy2(velocity)
+            tp_5g_nr = self.simulate_5g_nr_standard(velocity)
+            tp_dc = self.simulate_dual_connectivity(velocity)
+            tp_drl = self.simulate_drl_driven(velocity)
+            tp_isac = self.simulate_isac_baseline(velocity)
+            
+            # Store results
+            throughput_results['task4_policy1'].append(tp_task4_p1)
+            throughput_results['task4_policy2'].append(tp_task4_p2)
+            throughput_results['5g_nr_standard'].append(tp_5g_nr)
+            throughput_results['dual_connectivity'].append(tp_dc)
+            throughput_results['drl_driven'].append(tp_drl)
+            throughput_results['isac_baseline'].append(tp_isac)
+        
+        self.results['throughput_vs_velocity'] = {
+            'velocities': velocities,
+            'throughput': throughput_results
+        }
+        
+        return self.results['throughput_vs_velocity']
+    
+    def simulate_task4_policy1(self, velocity: float) -> float:
+        """Detective IH Policy - Sensor-assisted proactive handover"""
+        avg_throughput = 0
+        num_samples = 100
+        
+        for i in range(num_samples):
+            # Simulate dynamic channel conditions
+            distance = random.uniform(50, 500)  # Random UE distance
+            time_idx = random.randint(0, 1000)
+            
+            # Get SINR for both bands
+            sinr_frn = self.channel.calculate_sinr(distance, velocity, True, time_idx)
+            sinr_fr1 = self.channel.calculate_sinr(distance, velocity, False, time_idx)
+            
+            # Sensor detection (Policy₁ feature)
+            sensor_detection = random.random() > 0.1  # 90% detection rate
+            
+            # Trigger conditions (Equation 10)
+            trigger_frn_to_fr1 = ((sinr_frn < self.params.sinr_th_low) or 
+                                (not sensor_detection and sinr_frn < self.params.sinr_th_high))
+            
+            # Reactivation conditions (Equation 11)  
+            trigger_fr1_to_frn = (sinr_frn > self.params.sinr_th_react and 
+                                sensor_detection and
+                                random.random() > self.channel.blockage_probability)
+            
+            # Select active RAT based on triggers
+            if trigger_frn_to_fr1:
+                active_rat_sinr = sinr_fr1
+                active_is_frn = False
+            elif trigger_fr1_to_frn:
+                active_rat_sinr = sinr_frn
+                active_is_frn = True
+            else:
+                # Stay with current best RAT
+                if sinr_frn > sinr_fr1:
+                    active_rat_sinr = sinr_frn
+                    active_is_frn = True
+                else:
+                    active_rat_sinr = sinr_fr1
+                    active_is_frn = False
+            
+            # Calculate throughput based on selected RAT
+            bandwidth = self.params.frn_bandwidth if active_is_frn else self.params.fr1_bandwidth
+            spectral_eff = self.smtl.spectral_efficiency_component(active_rat_sinr, active_is_frn)
+            throughput = bandwidth * spectral_eff
+            
+            avg_throughput += throughput
+        
+        return avg_throughput / num_samples / 1e6  # Convert to Mbps
+
+    def simulate_task4_policy2(self, velocity: float) -> float:
+        """Reactive IH Policy - Measurement-based fallback"""
+        # Similar structure to Policy1 but with different triggering mechanism
+        # Uses continuous measurement reporting instead of sensor detection
+        avg_throughput = 0
+        num_samples = 100
+        
+        for i in range(num_samples):
+            distance = random.uniform(50, 500)
+            time_idx = random.randint(0, 1000)
+            
+            sinr_frn = self.channel.calculate_sinr(distance, velocity, True, time_idx)
+            sinr_fr1 = self.channel.calculate_sinr(distance, velocity, False, time_idx)
+            
+            # Policy₂ uses measurement-based triggering without sensors
+            if sinr_frn < self.params.sinr_th_low:
+                # Fallback to FR1
+                active_rat_sinr = sinr_fr1
+                active_is_frn = False
+            elif sinr_frn > self.params.sinr_th_react and sinr_frn > sinr_fr1:
+                # Use FRn if good enough
+                active_rat_sinr = sinr_frn
+                active_is_frn = True
+            else:
+                # Use FR1 as default
+                active_rat_sinr = sinr_fr1
+                active_is_frn = False
+            
+            bandwidth = self.params.frn_bandwidth if active_is_frn else self.params.fr1_bandwidth
+            spectral_eff = self.smtl.spectral_efficiency_component(active_rat_sinr, active_is_frn)
+            throughput = bandwidth * spectral_eff
+            
+            avg_throughput += throughput
+        
+        return avg_throughput / num_samples / 1e6  # Convert to Mbps
+
+    def simulate_5g_nr_standard(self, velocity: float) -> float:
+        """3GPP Rel-16 handover mechanism (baseline)"""
+        # Simplified 5G-NR with fixed thresholds and higher latency
+        avg_throughput = 0
+        num_samples = 100
+        
+        for i in range(num_samples):
+            distance = random.uniform(50, 500)
+            time_idx = random.randint(0, 1000)
+            
+            sinr_frn = self.channel.calculate_sinr(distance, velocity, True, time_idx)
+            sinr_fr1 = self.channel.calculate_sinr(distance, velocity, False, time_idx)
+            
+            # Basic handover with fixed threshold and velocity penalty
+            handover_margin = 2.0  # dB
+            velocity_penalty = 0.02 * velocity  # Higher velocity = more errors
+            
+            if sinr_frn > sinr_fr1 + handover_margin + random.gauss(0, velocity_penalty):
+                active_sinr = sinr_frn
+                active_is_frn = True
+            else:
+                active_sinr = sinr_fr1
+                active_is_frn = False
+            
+            bandwidth = self.params.frn_bandwidth if active_is_frn else self.params.fr1_bandwidth
+            spectral_eff = self.smtl.spectral_efficiency_component(active_sinr, active_is_frn)
+            throughput = bandwidth * spectral_eff
+            
+            avg_throughput += throughput
+        
+        return avg_throughput / num_samples / 1e6
+
+    def simulate_dual_connectivity(self, velocity: float) -> float:
+        """Dual connectivity baseline"""
+        # Always uses both links simultaneously
+        avg_throughput = 0
+        num_samples = 100
+        
+        for i in range(num_samples):
+            distance = random.uniform(50, 500)
+            time_idx = random.randint(0, 1000)
+            
+            sinr_frn = self.channel.calculate_sinr(distance, velocity, True, time_idx)
+            sinr_fr1 = self.channel.calculate_sinr(distance, velocity, False, time_idx)
+            
+            # Dual connectivity uses both links
+            throughput_frn = self.params.frn_bandwidth * self.smtl.spectral_efficiency_component(sinr_frn, True)
+            throughput_fr1 = self.params.fr1_bandwidth * self.smtl.spectral_efficiency_component(sinr_fr1, False)
+            
+            # Combined throughput (simplified)
+            total_throughput = throughput_frn + throughput_fr1
+            avg_throughput += total_throughput
+        
+        return avg_throughput / num_samples / 1e6
+
+    def simulate_drl_driven(self, velocity: float) -> float:
+        """DRL-based handover baseline"""
+        # Simplified DRL agent with learning capability
+        avg_throughput = 0
+        num_samples = 100
+        
+        for i in range(num_samples):
+            distance = random.uniform(50, 500)
+            time_idx = random.randint(0, 1000)
+            
+            sinr_frn = self.channel.calculate_sinr(distance, velocity, True, time_idx)
+            sinr_fr1 = self.channel.calculate_sinr(distance, velocity, False, time_idx)
+            
+            # DRL agent decision with exploration-exploitation
+            exploration_prob = max(0.1, 0.3 - 0.005 * velocity)  # Less exploration at high velocity
+            
+            if random.random() < exploration_prob:
+                # Exploration: random action
+                use_frn = random.random() > 0.5
+            else:
+                # Exploitation: choose best based on learned policy
+                use_frn = sinr_frn > sinr_fr1
+            
+            active_sinr = sinr_frn if use_frn else sinr_fr1
+            active_is_frn = use_frn
+            
+            bandwidth = self.params.frn_bandwidth if active_is_frn else self.params.fr1_bandwidth
+            spectral_eff = self.smtl.spectral_efficiency_component(active_sinr, active_is_frn)
+            throughput = bandwidth * spectral_eff
+            
+            avg_throughput += throughput
+        
+        return avg_throughput / num_samples / 1e6
+
+    def simulate_isac_baseline(self, velocity: float) -> float:
+        """ISAC-integrated baseline"""
+        # Integrated Sensing and Communication with basic sensing
+        avg_throughput = 0
+        num_samples = 100
+        
+        for i in range(num_samples):
+            distance = random.uniform(50, 500)
+            time_idx = random.randint(0, 1000)
+            
+            sinr_frn = self.channel.calculate_sinr(distance, velocity, True, time_idx)
+            sinr_fr1 = self.channel.calculate_sinr(distance, velocity, False, time_idx)
+            
+            # ISAC uses basic sensing for blockage prediction
+            blockage_prediction_accuracy = max(0.7, 0.9 - 0.01 * velocity)
+            predicted_blockage = random.random() < self.channel.blockage_probability
+            
+            if predicted_blockage and random.random() < blockage_prediction_accuracy:
+                # Avoid potential blockage by using FR1
+                active_sinr = sinr_fr1
+                active_is_frn = False
+            else:
+                # Use FRn for higher capacity
+                active_sinr = sinr_frn
+                active_is_frn = True
+            
+            bandwidth = self.params.frn_bandwidth if active_is_frn else self.params.fr1_bandwidth
+            spectral_eff = self.smtl.spectral_efficiency_component(active_sinr, active_is_frn)
+            throughput = bandwidth * spectral_eff
+            
+            avg_throughput += throughput
+        
+        return avg_throughput / num_samples / 1e6
+
+    def plot_results(self, results: dict):
+        """Generate publication-quality plots"""
+        velocities = results['velocities']
+        throughput = results['throughput']
+        
+        plt.figure(figsize=(12, 8))
+        
+        # Throughput vs Velocity plot
+        plt.subplot(2, 2, 1)
+        schemes = [
+            ('task4_policy1', 'Task₄-Policy₁', 'b-', 3),
+            ('task4_policy2', 'Task₄-Policy₂', 'g--', 2),
+            ('drl_driven', 'DRL-Driven', 'm-.', 2),
+            ('isac_baseline', 'ISAC', 'c:', 2),
+            ('dual_connectivity', 'Dual Connectivity', 'y-', 1),
+            ('5g_nr_standard', '5G-NR Standard', 'r-', 1)
+        ]
+        
+        for scheme_key, label, style, width in schemes:
+            plt.plot(velocities, throughput[scheme_key], style, 
+                    label=label, linewidth=width, markersize=6)
+        
+        plt.xlabel('UE Velocity (km/h)')
+        plt.ylabel('Throughput (Mbps)')
+        plt.title('Throughput vs UE Velocity')
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+        
+        # Performance gain analysis
+        plt.subplot(2, 2, 2)
+        task4_p1 = np.array(throughput['task4_policy1'])
+        baseline_5g = np.array(throughput['5g_nr_standard'])
+        performance_gain = ((task4_p1 - baseline_5g) / baseline_5g) * 100
+        
+        plt.plot(velocities, performance_gain, 'b-o', linewidth=2)
+        plt.xlabel('UE Velocity (km/h)')
+        plt.ylabel('Performance Gain Over 5G-NR (%)')
+        plt.title('Task₄-Policy₁ Performance Gain')
+        plt.grid(True, alpha=0.3)
+        
+        # Scheme comparison at high velocity
+        plt.subplot(2, 2, 3)
+        high_vel_index = -1  # 60 km/h
+        scheme_names = [label for _, label, _, _ in schemes]
+        throughput_at_60kmh = [throughput[scheme_key][high_vel_index] 
+                              for scheme_key, _, _, _ in schemes]
+        
+        plt.bar(scheme_names, throughput_at_60kmh, alpha=0.7)
+        plt.xticks(rotation=45)
+        plt.ylabel('Throughput at 60 km/h (Mbps)')
+        plt.title('Performance Comparison at High Mobility')
+        
+        # Adaptation analysis
+        plt.subplot(2, 2, 4)
+        velocity_gradient = np.gradient(task4_p1, velocities)
+        plt.plot(velocities, velocity_gradient, 'r-o', linewidth=2)
+        plt.xlabel('UE Velocity (km/h)')
+        plt.ylabel('Throughput Gradient (Mbps/(km/h))')
+        plt.title('Task₄-Policy₁ Adaptation to Velocity Changes')
+        plt.grid(True, alpha=0.3)
+        
+        plt.tight_layout()
+        plt.savefig('hydra_ran_throughput_analysis.png', dpi=300, bbox_inches='tight')
+        plt.show()
+
+    def update_parameters(self, **kwargs):
+        """Dynamically update simulation parameters"""
+        for key, value in kwargs.items():
+            if hasattr(self.params, key):
+                setattr(self.params, key, value)
+                print(f"Updated parameter {key} to {value}")
+        
+        # Reinitialize components with new parameters
+        self.channel.setup_channel_parameters()
+        self.smtl.setup_smtl_parameters()
+
+def run_simulation():
+    """Main function to run the complete simulation"""
+    # Initialize parameters
+    params = SimulationParameters()
+    
+    # Create simulator
+    simulator = HydraRANSimulator(params)
+    
+    # Run main simulation
+    print("Running comprehensive Hydra-RAN simulation...")
+    results = simulator.simulate_throughput_vs_velocity()
+    
+    # Plot results
+    simulator.plot_results(results)
+    
+    # Display summary statistics
+    print("\n=== Simulation Results Summary ===")
+    velocities = results['velocities']
+    throughput = results['throughput']
+    
+    high_vel_idx = -1  # 60 km/h point
+    print(f"Performance at {velocities[high_vel_idx]:.1f} km/h:")
+    for scheme in throughput.keys():
+        tp_value = throughput[scheme][high_vel_idx]
+        print(f"  {scheme:20}: {tp_value:6.2f} Mbps")
+    
+    # Calculate performance improvement
+    task4_p1 = throughput['task4_policy1'][high_vel_idx]
+    baseline_5g = throughput['5g_nr_standard'][high_vel_idx]
+    improvement = ((task4_p1 - baseline_5g) / baseline_5g) * 100
+    print(f"\nTask₄-Policy₁ improvement over 5G-NR: {improvement:.1f}%")
+    
+    return simulator, results
+
+# Example of dynamic parameter update
+def demonstrate_dynamic_updates():
+    """Show how parameters can be dynamically updated"""
+    params = SimulationParameters()
+    simulator = HydraRANSimulator(params)
+    
+    # Initial simulation
+    results1 = simulator.simulate_throughput_vs_velocity()
+    
+    # Update key parameters and re-run
+    print("\n--- Updating simulation parameters ---")
+    simulator.update_parameters(
+        sinr_th_low=8.0,      # More conservative handover
+        sinr_th_react=15.0,   # Higher reactivation threshold
+        omega1=0.5,           # Higher weight on spectral efficiency
+        omega2=0.2,           # Lower weight on reliability
+        omega3=0.3            # Same switching cost
+    )
+    
+    # Re-run with updated parameters
+    results2 = simulator.simulate_throughput_vs_velocity()
+    
+    return results1, results2
+
+if __name__ == "__main__":
+    # Run the complete simulation
+    simulator, results = run_simulation()
+    
+    # Demonstrate dynamic updates (optional)
+    # results1, results2 = demonstrate_dynamic_updates()
