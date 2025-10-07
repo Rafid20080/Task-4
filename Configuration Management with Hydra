@@ -1,0 +1,75 @@
+conf/
+├── config.yaml
+├── simulation
+│   ├── default.yaml
+│   └── high_mobility.yaml
+└── thresholds
+    ├── conservative.yaml
+    └── aggressive.yaml
+
+
+# conf/config.yaml:
+
+defaults:
+  - simulation: default
+  - thresholds: conservative
+  - _self_
+
+output:
+  plot_path: "results/blockage_recovery_plot.png"
+  results_csv: "results/simulation_results.csv"
+
+detection:
+  beam_failure_instance_max_count: 4
+  beam_failure_detection_timer: 100.0
+
+# conf/simulation/default.yaml:
+
+simulation:
+  velocity_min: 1
+  velocity_max: 60
+  velocity_step: 2
+  num_measurements: 15
+  num_monte_carlo_runs: 50
+
+# Dynamic Output Generation
+
+def generate_dynamic_report(results: Dict, config: NetworkParameters):
+    """Generate dynamic performance analysis report"""
+    
+    report = {
+        'optimal_velocity_ranges': {},
+        'improvement_metrics': {},
+        'sensitivity_analysis': {}
+    }
+    
+    # Find optimal velocity ranges for each policy
+    for policy in ['policy_1', 'policy_2']:
+        recovery_times = results[policy]
+        velocities = results['velocity']
+        
+        # Find velocities where recovery time < 100ms (URLLC requirement)
+        optimal_mask = np.array(recovery_times) < 100
+        optimal_velocities = np.array(velocities)[optimal_mask]
+        
+        if len(optimal_velocities) > 0:
+            report['optimal_velocity_ranges'][policy] = {
+                'min': float(np.min(optimal_velocities)),
+                'max': float(np.max(optimal_velocities)),
+                'avg_recovery': float(np.mean(np.array(recovery_times)[optimal_mask]))
+            }
+    
+    # Calculate improvement metrics
+    baseline_times = results['5g_nr']
+    for policy in ['policy_1', 'policy_2']:
+        policy_times = results[policy]
+        improvements = [100 * (baseline - policy) / baseline 
+                       for baseline, policy in zip(baseline_times, policy_times)]
+        
+        report['improvement_metrics'][policy] = {
+            'average_improvement': float(np.mean(improvements)),
+            'max_improvement': float(np.max(improvements)),
+            'min_improvement': float(np.min(improvements))
+        }
+    
+    return report
