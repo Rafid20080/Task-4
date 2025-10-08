@@ -1,0 +1,192 @@
+# Core Simulation Architecture
+import numpy as np
+import matplotlib.pyplot as plt
+from enum import Enum
+from dataclasses import dataclass
+from typing import List, Dict, Tuple
+
+@dataclass
+class SimulationConfig:
+    """Centralized configuration for all simulation parameters."""
+    # UE Velocity Range (km/h)
+    velocity_range: np.ndarray = np.array([1, 10, 20, 30, 40, 50, 60])
+    # SINR Thresholds (dB)
+    sinr_th_low: float = -5.0      # Γ_th^low for FRn->FR1 fallback
+    sinr_th_high: float = 2.0      # Γ_th^high for proactive fallback
+    sinr_th_react: float = 5.0     # Γ_th^react for FR1->FRn reactivation
+    # Handover Latency Components (ms)
+    t_measurement: float = 5.0
+    t_reporting: float = 8.0
+    t_processing: float = 3.0
+    t_signaling: float = 15.0
+    # Policy Weights
+    policy1_weight: float = 0.7    # Detective IH (Policy₁)
+    policy2_weight: float = 0.3    # Reactive IH (Policy₂)
+
+class HandoverPolicy(Enum):
+    """Enumeration of handover policies."""
+    DETECTIVE_IH = "Policy₁ (Detective IH)"
+    REACTIVE_IH = "Policy₂ (Reactive IH)"
+    DRL_DRIVEN = "DRL-Driven"
+    ISAC_BASELINE = "ISAC"
+    DUAL_CONNECTIVITY = "Dual Connectivity"
+    STANDARD_5GNR = "5G-NR Standard"
+
+
+
+
+  # Handover Latency Model Implementation
+
+  class HandoverLatencyModel:
+    """Models handover latency based on UE velocity and selected policy."""
+    
+    def __init__(self, config: SimulationConfig):
+        self.config = config
+    
+    def compute_baseline_latency(self, velocity: float, policy: HandoverPolicy) -> float:
+        """Computes total handover latency for a given policy and UE velocity."""
+        # Base latency components from the manuscript
+        base_components = (
+            self.config.t_measurement + 
+            self.config.t_reporting + 
+            self.config.t_processing + 
+            self.config.t_signaling
+        )
+        
+        # Velocity-dependent scaling factor
+        velocity_scale = 1.0 + (velocity / 60.0) * 0.8  # 80% increase at 60 km/h
+        
+        # Policy-specific optimization factors
+        policy_optimization = self._get_policy_optimization(policy)
+        
+        return base_components * velocity_scale * policy_optimization
+    
+    def _get_policy_optimization(self, policy: HandoverPolicy) -> float:
+        """Returns latency optimization factor for each policy."""
+        optimization_factors = {
+            HandoverPolicy.DETECTIVE_IH: 0.4,      # 60% reduction: core-network independence + sensor bypass
+            HandoverPolicy.REACTIVE_IH: 0.6,       # 40% reduction: partial measurement bypass
+            HandoverPolicy.DRL_DRIVEN: 0.7,        # 30% reduction: adaptive DRL optimization
+            HandoverPolicy.ISAC_BASELINE: 0.8,     # 20% reduction: sensing-assisted
+            HandoverPolicy.DUAL_CONNECTIVITY: 0.9, # 10% reduction: secondary link
+            HandoverPolicy.STANDARD_5GNR: 1.0      # No optimization
+        }
+        return optimization_factors[policy]
+
+
+          # Dynamic Policy Implementation
+
+class HydraRANSimulator:
+    """Main simulator implementing Hydra-RAN Task-4 architecture."""
+    
+    def __init__(self, config: SimulationConfig):
+        self.config = config
+        self.latency_model = HandoverLatencyModel(config)
+    
+    def execute_policy(self, velocity: float, sinr_frn: float, 
+                       sensor_available: bool) -> Dict:
+        """Executes hybrid Policy₁ + Policy₂ decision with velocity adaptation."""
+        
+        # Adaptive threshold adjustment based on velocity
+        adaptive_th_low = self.config.sinr_th_low - (velocity / 60.0) * 2.0
+        adaptive_th_react = self.config.sinr_th_react + (velocity / 60.0) * 1.0
+        
+        # Policy selection logic
+        use_policy1 = sensor_available and (sinr_frn < adaptive_th_low)
+        
+        if use_policy1:
+            policy = HandoverPolicy.DETECTIVE_IH
+            latency = self.latency_model.compute_baseline_latency(velocity, policy)
+            trigger_reason = "Sensor-assisted proactive handover"
+        else:
+            policy = HandoverPolicy.REACTIVE_IH
+            latency = self.latency_model.compute_baseline_latency(velocity, policy)
+            trigger_reason = "Reactive measurement-based handover"
+        
+        return {
+            'velocity': velocity,
+            'policy': policy,
+            'latency': latency,
+            'trigger_reason': trigger_reason,
+            'adaptive_threshold_low': adaptive_th_low,
+            'adaptive_threshold_react': adaptive_th_react
+        }
+
+
+          # Comparative Analysis Engine
+
+def run_comparative_analysis(config: SimulationConfig) -> Dict[str, List[float]]:
+    """Runs comparative analysis across all handover schemes."""
+    simulator = HydraRANSimulator(config)
+    results = {policy.value: [] for policy in HandoverPolicy}
+    
+    for velocity in config.velocity_range:
+        # Test all policies under identical conditions
+        for policy in HandoverPolicy:
+            if policy in [HandoverPolicy.DETECTIVE_IH, HandoverPolicy.REACTIVE_IH]:
+                # Use hybrid policy decision for Task-4
+                result = simulator.execute_policy(
+                    velocity, 
+                    sinr_frn=-3.0,  # Example degraded SINR
+                    sensor_available=True
+                )
+                latency = result['latency']
+            else:
+                # Baseline policies
+                latency = simulator.latency_model.compute_baseline_latency(velocity, policy)
+            
+            results[policy.value].append(latency)
+    
+    return results
+
+def visualize_results(results: Dict[str, List[float]], config: SimulationConfig):
+    """Generates dynamic visualization of handover latency vs. velocity."""
+    plt.figure(figsize=(12, 8))
+    
+    for policy_name, latencies in results.items():
+        plt.plot(config.velocity_range, latencies, 
+                marker='o', linewidth=2, label=policy_name)
+    
+    plt.xlabel('UE Velocity (km/h)', fontsize=12)
+    plt.ylabel('Handover Latency (ms)', fontsize=12)
+    plt.title('Handover Latency vs. UE Velocity: Hydra-RAN Task-4 vs. Baselines', fontsize=14)
+    plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.show()
+
+
+  # Execution and Dynamic Parameter Analysis
+
+# Initialize simulation with default parameters
+config = SimulationConfig()
+simulator = HydraRANSimulator(config)
+
+# Execute comparative analysis
+print("Running Handover Latency Analysis...")
+results = run_comparative_analysis(config)
+
+# Generate visualization
+visualize_results(results, config)
+
+# Parameter sensitivity analysis
+def analyze_parameter_sensitivity():
+    """Demonstrates dynamic response to parameter modifications."""
+    parameter_sets = [
+        {"sinr_th_low": -8.0, "sinr_th_react": 3.0, "label": "Aggressive Handover"},
+        {"sinr_th_low": -2.0, "sinr_th_react": 7.0, "label": "Conservative Handover"},
+    ]
+    
+    for params in parameter_sets:
+        modified_config = SimulationConfig(**params)
+        modified_results = run_comparative_analysis(modified_config)
+        print(f"\n=== {params['label']} Configuration ===")
+        for policy in [HandoverPolicy.DETECTIVE_IH.value, HandoverPolicy.REACTIVE_IH.value]:
+            avg_latency = np.mean(modified_results[policy])
+            print(f"{policy}: Average Latency = {avg_latency:.2f} ms")
+
+# Execute sensitivity analysis
+analyze_parameter_sensitivity()
+  
+
+          
