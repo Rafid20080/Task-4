@@ -1,0 +1,441 @@
+# Core Framework Structure
+
+hydra_ran_simulator/
+├── configs/                           # Hydra configuration management
+│   ├── model/
+│   │   ├── task4_policy1.yaml        # Detective IH configuration
+│   │   ├── task4_policy2.yaml        # Reactive IH configuration  
+│   │   └── baselines/                # Baseline schemes
+│   ├── environment/
+│   │   ├── channel_models.yaml       # 3GPP channel configurations
+│   │   ├── mobility.yaml             # UE velocity profiles
+│   │   └── blockage_models.yaml      # Level₂ blockage scenarios
+│   └── experiment/
+│       ├── velocity_sweep.yaml       # UE velocity experiments
+│       └── hparam_search.yaml        # Hyperparameter optimization
+├── src/
+│   ├── models/                       # Neural network architectures
+│   │   ├── smtl_framework.py         # Multi-task learning model
+│   │   ├── drl_agent.py              # PPO-based DRL agent
+│   │   └── policy_controllers.py     # Policy₁ and Policy₂ implementations
+│   ├── environment/
+│   │   ├── network_simulator.py      # Main simulation environment
+│   │   ├── channel_3gpp.py           # 3GPP-compliant channel model
+│   │   └── mobility_manager.py       # UE mobility patterns
+│   ├── data/                         # Data processing modules
+│   │   ├── multimodal_loader.py      # RF + sensor data integration
+│   │   └── dataset_generators.py     # Synthetic data generation
+│   └── utils/
+│       ├── metrics.py                # Performance metrics calculation
+│       └── visualization.py          # Dynamic plotting and results
+├── logs/                             # Automated experiment tracking
+│   ├── tensorboard/                  # Training visualization
+│   ├── checkpoints/                  # Model saving/loading
+│   └── results/                      # Performance results
+└── scripts/
+    ├── train.py                      # Main training script
+    ├── evaluate.py                   # Evaluation and benchmarking
+    └── sweep_analysis.py             # Parameter sweep analysis
+
+
+
+
+  # Key Configuration Management (Hydra)
+
+# configs/experiment/velocity_sweep.yaml
+defaults:
+  - model: task4_policy1
+  - environment: channel_models
+  - _self_
+
+hydra:
+  sweep:
+    dir: logs/velocity_sweep/${now:%Y-%m-%d_%H-%M-%S}
+    subdir: ${ue_velocity}km_h
+
+ue_velocity:
+  range: [1, 5, 10, 20, 30, 40, 50, 60]  # km/h
+
+evaluation:
+  metrics:
+    - handover_success_rate
+    - throughput
+    - latency  
+    - outage_probability
+    - recovery_time
+  num_episodes: 1000
+  confidence_interval: 0.95
+
+# configs/model/task4_policy1.yaml
+model:
+  name: "Task4-Policy1-Detective"
+  architecture:
+    umbrella_coverage: true
+    core_network_independent: true
+    sensor_assisted: true
+  
+  smtl:
+    input_modalities: ["rf", "sensor", "mobility"]
+    tasks: ["beam_prediction", "blockage_prediction", "mobility_prediction", "sinr_prediction"]
+    uncertainty_weighting: true
+  
+  drl:
+    algorithm: "PPO"
+    state_dim: 16
+    action_dim: 5
+    hidden_layers: [256, 128]
+    learning_rate: 3e-4
+
+
+  # 1. Network Environment Simulator
+
+import torch
+import numpy as np
+from omegaconf import DictConfig
+import hydra
+from src.environment.channel_3gpp import Channel3GPP
+from src.environment.mobility_manager import MobilityManager
+
+class HydraRANSimulator:
+    def __init__(self, cfg: DictConfig):
+        self.cfg = cfg
+        self.channel_model = Channel3GPP(cfg.environment.channel)
+        self.mobility_manager = MobilityManager(cfg.environment.mobility)
+        self.ue_velocities = cfg.ue_velocity.range
+        
+        # Initialize network topology
+        self.setup_umbrella_coverage()
+        
+    def setup_umbrella_coverage(self):
+        """Initialize FR1 + FRn hierarchical architecture"""
+        self.sru_fr1 = SRU(
+            frequency="FR1", 
+            coverage_radius=1000,  # meters
+            reliability=0.99
+        )
+        self.sru_frn_cluster = [
+            SRU(f"FRn_{i}", frequency="FRn", coverage_radius=200)
+            for i in range(self.cfg.environment.num_frn_srus)
+        ]
+        
+    def calculate_utility(self, ue, sru, time_step):
+        """Context-aware utility function from Eq. (1)"""
+        spectral_efficiency = self.calculate_spectral_efficiency(ue, sru, time_step)
+        reliability = self.calculate_reliability(ue, sru, time_step)
+        switching_cost = self.calculate_switching_cost(ue, sru)
+        
+        utility = (self.cfg.weights.omega1 * spectral_efficiency +
+                  self.cfg.weights.omega2 * reliability -
+                  self.cfg.weights.omega3 * switching_cost)
+        
+        return utility
+    
+    def step(self, action, ue_velocity):
+        """Execute one simulation step"""
+        # Update UE positions based on velocity
+        self.mobility_manager.update_ue_positions(ue_velocity)
+        
+        # Calculate channel conditions
+        channel_state = self.channel_model.get_channel_state()
+        
+        # Apply handover policy
+        reward, done = self.apply_handover_policy(action, channel_state)
+        
+        # Get next state observation
+        next_state = self.get_state_representation()
+        
+        return next_state, reward, done, self.get_metrics()
+
+
+
+  # SMTL Framework Implementation
+
+import torch.nn as nn
+import pytorch_lightning as pl
+
+class SMTLFramework(pl.LightningModule):
+    def __init__(self, cfg: DictConfig):
+        super().__init__()
+        self.cfg = cfg
+        self.save_hyperparameters()
+        
+        # Modality-specific encoders
+        self.rf_encoder = RFEncoder(cfg.model.smtl.rf_encoder)
+        self.sensor_encoder = SensorEncoder(cfg.model.smtl.sensor_encoder)
+        self.mobility_encoder = MobilityEncoder(cfg.model.smtl.mobility_encoder)
+        
+        # Task-specific heads
+        self.beam_head = BeamPredictionHead(cfg.model.smtl.beam_head)
+        self.blockage_head = BlockagePredictionHead(cfg.model.smtl.blockage_head)
+        self.mobility_head = MobilityPredictionHead(cfg.model.smtl.mobility_head)
+        self.sinr_head = SINRPredictionHead(cfg.model.smtl.sinr_head)
+        
+        # Learnable uncertainty parameters
+        self.log_vars = nn.Parameter(torch.zeros(4))
+        
+    def forward(self, x):
+        rf_features = self.rf_encoder(x['rf'])
+        sensor_features = self.sensor_encoder(x['sensor']) 
+        mobility_features = self.mobility_encoder(x['mobility'])
+        
+        # Feature fusion
+        shared_features = torch.cat([rf_features, sensor_features, mobility_features], dim=1)
+        
+        # Multi-task predictions
+        beam_pred = self.beam_head(shared_features)
+        blockage_pred = self.blockage_head(shared_features)
+        mobility_pred = self.mobility_head(shared_features)
+        sinr_pred = self.sinr_head(shared_features)
+        
+        return beam_pred, blockage_pred, mobility_pred, sinr_pred
+    
+    def training_step(self, batch, batch_idx):
+        x, y = batch
+        predictions = self(x)
+        
+        # Multi-task loss with uncertainty weighting (Eq. 22)
+        total_loss = 0
+        for i, (pred, target) in enumerate(zip(predictions, y)):
+            task_loss = self.task_losses[i](pred, target)
+            total_loss += torch.exp(-self.log_vars[i]) * task_loss + self.log_vars[i]
+            
+        self.log('train_total_loss', total_loss)
+        return total_loss
+
+
+
+  # DRL Agent with PPO
+
+  class HydraRANDRLAgent(pl.LightningModule):
+    def __init__(self, cfg: DictConfig):
+        super().__init__()
+        self.cfg = cfg
+        self.automatic_optimization = False
+        
+        # Actor-Critic networks
+        self.actor = ActorNetwork(cfg.model.drl.state_dim, cfg.model.drl.action_dim)
+        self.critic = CriticNetwork(cfg.model.drl.state_dim)
+        
+        # Experience replay
+        self.memory = ExperienceReplay(cfg.model.drl.memory_size)
+        
+    def get_action(self, state, deterministic=False):
+        """Get handover decision from policy"""
+        state_tensor = torch.FloatTensor(state).unsqueeze(0).to(self.device)
+        
+        with torch.no_grad():
+            action_probs = self.actor(state_tensor)
+            
+        if deterministic:
+            action = torch.argmax(action_probs, dim=1)
+        else:
+            dist = torch.distributions.Categorical(action_probs)
+            action = dist.sample()
+            
+        return action.item(), action_probs
+    
+    def calculate_reward(self, state, action, next_state):
+        """Multi-objective reward function (Eq. 30)"""
+        throughput_reward = self.calculate_throughput_reward(state, next_state)
+        latency_reward = self.calculate_latency_reward(state, action)
+        reliability_reward = self.calculate_reliability_reward(state)
+        efficiency_reward = self.calculate_efficiency_reward(action)
+        
+        total_reward = (self.cfg.reward_weights.w1 * throughput_reward +
+                       self.cfg.reward_weights.w2 * latency_reward +
+                       self.cfg.reward_weights.w3 * reliability_reward +
+                       self.cfg.reward_weights.w4 * efficiency_reward)
+        
+        return total_reward
+
+
+  # Performance Metrics Calculator
+
+class PerformanceMetrics:
+    def __init__(self):
+        self.metrics_history = {
+            'handover_success_rate': [],
+            'throughput': [],
+            'latency': [],
+            'outage_probability': [],
+            'recovery_time': []
+        }
+        
+    def calculate_handover_success_rate(self, episodes):
+        successful_handovers = sum(1 for episode in episodes 
+                                 if episode['handover_success'])
+        total_handovers = len(episodes)
+        return successful_handovers / total_handovers if total_handovers > 0 else 0
+    
+    def calculate_velocity_dependent_metrics(self, episodes, velocity):
+        """Calculate metrics for specific UE velocity"""
+        velocity_episodes = [e for e in episodes if e['ue_velocity'] == velocity]
+        
+        metrics = {
+            'velocity': velocity,
+            'handover_success_rate': self.calculate_handover_success_rate(velocity_episodes),
+            'average_throughput': np.mean([e['throughput'] for e in velocity_episodes]),
+            'average_latency': np.mean([e['latency'] for e in velocity_episodes]),
+            'outage_probability': np.mean([e['outage'] for e in velocity_episodes]),
+            'recovery_time': np.mean([e['recovery_time'] for e in velocity_episodes])
+        }
+        
+        return metrics
+    
+    def generate_comparative_analysis(self, all_results):
+        """Compare Hydra-RAN against all baselines"""
+        comparison_data = {}
+        
+        for scheme, results in all_results.items():
+            comparison_data[scheme] = {
+                'handover_success_vs_velocity': [
+                    self.calculate_velocity_dependent_metrics(results, v) 
+                    for v in self.ue_velocities
+                ]
+            }
+        
+        return comparison_data
+
+
+
+          # Main Training Script with Hydra Integration
+
+
+import hydra
+from omegaconf import DictConfig
+import pytorch_lightning as pl
+from pytorch_lightning.loggers import TensorBoardLogger, WandbLogger
+
+@hydra.main(config_path="configs", config_name="train", version_base=None)
+def main(cfg: DictConfig):
+    # Set random seeds for reproducibility
+    pl.seed_everything(cfg.seed)
+    
+    # Initialize model and data
+    model = HydraRANDRLAgent(cfg.model)
+    datamodule = HydraRANDataModule(cfg.data)
+    
+    # Configure loggers
+    loggers = []
+    if cfg.logger.tensorboard:
+        loggers.append(TensorBoardLogger("logs/tensorboard/"))
+    if cfg.logger.wandb:
+        loggers.append(WandbLogger(project="hydra-ran-sim"))
+    
+    # Configure trainer
+    trainer = pl.Trainer(
+        max_epochs=cfg.training.max_epochs,
+        devices=cfg.training.devices,
+        accelerator=cfg.training.accelerator,
+        logger=loggers,
+        callbacks=[cfg.callbacks],
+        deterministic=True
+    )
+    
+    # Train model
+    trainer.fit(model, datamodule)
+    
+    # Evaluate on test set
+    trainer.test(model, datamodule)
+
+if __name__ == "__main__":
+    main()
+
+
+# Configuration-Based Baseline Comparison
+
+# configs/experiment/baseline_comparison.yaml
+defaults:
+  - override /model: task4_policy1
+  - _self_
+
+baselines:
+  - name: "5G-NR-Standard"
+    config: "configs/model/baselines/5g_nr.yaml"
+    description: "3GPP Rel-16 handover mechanism"
+    
+  - name: "Dual-Connectivity"
+    config: "configs/model/baselines/dual_connectivity.yaml" 
+    description: "Fixed threshold-based switching"
+    
+  - name: "DRL-Driven"
+    config: "configs/model/baselines/drl_driven.yaml"
+    description: "DRL for adaptive handover"
+    
+  - name: "ISAC"
+    config: "configs/model/baselines/isac.yaml"
+    description: "Integrated sensing and communication"
+
+evaluation:
+  metrics_comparison: true
+  statistical_significance_testing: true
+  confidence_level: 0.95
+  velocity_sweep: [1, 5, 10, 20, 30, 40, 50, 60]
+
+
+
+
+ # Real-Time Visualization System
+
+
+class ResultsVisualizer:
+    def __init__(self, cfg: DictConfig):
+        self.cfg = cfg
+        self.setup_plotting_style()
+        
+    def plot_handover_success_vs_velocity(self, results_dict, save_path=None):
+        """Generate handover success rate vs velocity plot (Fig. 1 in manuscript)"""
+        fig, ax = plt.subplots(figsize=(10, 6))
+        
+        velocities = np.array([1, 5, 10, 20, 30, 40, 50, 60])
+        
+        for scheme, results in results_dict.items():
+            success_rates = [results[v]['handover_success_rate'] for v in velocities]
+            ax.plot(velocities, success_rates, label=scheme, marker='o', linewidth=2)
+        
+        ax.set_xlabel('UE Velocity (km/h)')
+        ax.set_ylabel('Handover Success Rate (%)')
+        ax.set_title('Handover Success Rate vs UE Velocity')
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+        
+        if save_path:
+            plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        plt.show()
+    
+    def generate_comprehensive_dashboard(self, all_results):
+        """Generate complete evaluation dashboard"""
+        metrics = ['handover_success_rate', 'throughput', 'latency', 
+                  'outage_probability', 'recovery_time']
+        
+        fig, axes = plt.subplots(2, 3, figsize=(18, 12))
+        
+        for i, metric in enumerate(metrics):
+            ax = axes[i // 3, i % 3]
+            self.plot_metric_vs_velocity(all_results, metric, ax)
+            
+        plt.tight_layout()
+        return fig
+
+
+  
+  
+# Adaptive Parameter Updates
+
+
+  # Sweep across UE velocities
+python train.py -m ue_velocity=1,5,10,20,30,40,50,60
+
+# Compare different policies
+python train.py model=task4_policy1, task4_policy2, drl_driven, isac
+
+# Modify environment parameters
+python train.py environment.pathloss_exponent=2.0,2.5,3.0 environment.blockage_probability=0.1,0.2,0.3
+
+  
+  
+
+          
+  
+  
+  
